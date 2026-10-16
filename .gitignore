@@ -1,0 +1,9 @@
+/target
+*.log
+claude-pids.txt
+enforce-*.txt
+doctor-tmp.txt
+expected-exit-ip.txt
+renew-deadline.txt
+proxy-state.txt
+config.json

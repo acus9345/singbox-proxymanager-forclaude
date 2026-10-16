@@ -1,0 +1,17 @@
+[package]
+name = "singbox-watch"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+winapi = { version = "0.3", features = [
+    "winuser", "wingdi", "winbase", "libloaderapi", "synchapi",
+    "tlhelp32", "handleapi", "errhandlingapi", "winreg", "winnt", "winerror",
+    "shellapi", "processthreadsapi", "wincon", "processenv", "consoleapi",
+    "memoryapi",
+] }
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"
