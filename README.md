@@ -2,7 +2,7 @@
 
 A Windows tray controller, watchdog and fail-safe toolkit for a
 [sing-box](https://sing-box.sagernet.org) tunnel with a **static exit IP**.
-BETTER PUT IT BESIDES SINGBOX
+BETTER PUT IT BESIDES SINGBOX.
 
 If your machine routes all traffic through a SOCKS5/TUN tunnel and you want
 to be certain it never silently falls back to the raw connection, this is
