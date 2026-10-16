@@ -17,7 +17,7 @@ Two small binaries (Rust, winapi only, no GUI framework):
 | `singbox-watch.exe` | always-on-top warning banner when the exit IP stops matching the pinned IP |
 
 ## Features
-
+- **to use some of the features go to show hidden icons button on ur task bar and right click our app icon**
 - **Tray switch** — green icon when the exit IP matches the pinned IP, red
   when it doesn't. Left-click toggles the tunnel (starts/stops a scheduled
   task; a UAC prompt appears when elevation is needed). The tooltip always
