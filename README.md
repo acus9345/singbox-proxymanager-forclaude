@@ -1,6 +1,6 @@
 # singbox-watch
 
-A Windows(well u can use it on mac but idk if this works) tray controller, watchdog and fail-safe toolkit for a
+A Windows(well u can use the mac branch on mac but idk if this works) tray controller, watchdog and fail-safe toolkit for a
 [sing-box](https://sing-box.sagernet.org) tunnel with a **static exit IP**.
 BETTER PUT IT BESIDES SINGBOX.
 
