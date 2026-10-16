@@ -1,0 +1,14 @@
+[package]
+name = "singbox-watch-mac"
+version = "1.0.0"
+edition = "2021"
+description = "macOS port of singbox-watch: menu-bar switch, kill-switch and watchdog for sing-box tunnels"
+
+[dependencies]
+tao = "0.30"
+tray-icon = "0.19"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"

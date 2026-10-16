@@ -1,0 +1,6 @@
+/target
+*.log
+expected-exit-ip.txt
+renew-deadline.txt
+proxy-state.txt
+.DS_Store
