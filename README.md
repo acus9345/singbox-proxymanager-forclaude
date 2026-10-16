@@ -28,6 +28,11 @@ Two small binaries (Rust, winapi only, no GUI framework):
 - **Always-on-top banner** — red "TUNNEL BYPASSED" banner when the exit IP
   changes unexpectedly; amber for intentional off / no connectivity.
   Left-click snoozes, right-click quits.
+- **Keep-closed policy (100 ms detection)** — while the proxy is off, matched
+  applications are closed within a tenth of a second of appearing, and a
+  topmost Yes/No dialog asks (once per off-episode): *keep them closed?*
+  Unanswered = keep closed (the safe default). **Yes** keeps closing them on
+  sight; **No** switches to the auto-enable behavior below.
 - **Auto-enable guard** — if a matched app starts (or a fresh
   DNS lookup for a watched domain occurs) while the tunnel is down, the
   app processes are suspended, the tunnel is started, and they are resumed
