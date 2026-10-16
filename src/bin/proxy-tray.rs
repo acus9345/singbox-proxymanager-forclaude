@@ -248,6 +248,34 @@ fn stop_tunnel_blocking() {
 
 static EPISODE_TRIGGERED: AtomicU8 = AtomicU8::new(0);
 
+// policy for matched apps while the proxy is off:
+// 1 = keep closed (safe default — killed on sight, dialog pending)
+// 2 = allow (falls back to the auto-enable guard: starting the app
+//     re-enables the proxy instead)
+static KEEP_CLOSED: AtomicU8 = AtomicU8::new(1);
+static ASKED_EPISODE: AtomicU8 = AtomicU8::new(0);
+
+fn ask_keep_closed() {
+    thread::spawn(|| {
+        log_line("[ask] proxy off + matched apps closed — asking whether to keep them closed");
+        let mb = unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                wide("The proxy is OFF, so matched applications were closed to keep them off the raw connection.\n\nKeep them closed while the proxy stays off?\n\nYes — they stay closed (relaunches are closed again automatically)\nNo — allow them to run (the proxy will re-enable itself when they start)").as_ptr(),
+                wide("singbox-watch — proxy is off").as_ptr(),
+                MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+            )
+        };
+        if mb == IDYES {
+            KEEP_CLOSED.store(1, Ordering::Relaxed);
+            log_line("[ask] answer: keep closed");
+        } else {
+            KEEP_CLOSED.store(2, Ordering::Relaxed);
+            log_line("[ask] answer: allow (auto-enable on start)");
+        }
+    });
+}
+
 // minimal view of a DNS resolver cache entry — only the fields we walk
 #[repr(C)]
 struct CacheEntry {
@@ -695,10 +723,13 @@ fn guard_loop(hwnd: HWND) {
         if actual == 1 {
             EPISODE_TRIGGERED.store(0, Ordering::Relaxed);
             seen_dns.clear();
+            // new off-episode: re-arm the keep-closed policy (safe default)
+            KEEP_CLOSED.store(1, Ordering::Relaxed);
+            ASKED_EPISODE.store(0, Ordering::Relaxed);
             // drop stale pid list — pids get reused; never act on old data
             let _ = std::fs::remove_file(pids_file());
         } else {
-            if tick % 5 == 0 {
+            if tick % 100 == 0 {
                 // fire-and-forget refresh of node-based claude pids (file read next ticks)
                 let excl = kill_exclusions();
                 let notmatch = if excl.is_empty() {
@@ -715,8 +746,20 @@ fn guard_loop(hwnd: HWND) {
                 );
             }
             let pids = claude_pids_snapshot();
-            if !pids.is_empty() && EPISODE_TRIGGERED.load(Ordering::Relaxed) == 0 {
-                auto_enable(pids, "claude process detected", hwnd as usize);
+            if !pids.is_empty() {
+                if KEEP_CLOSED.load(Ordering::Relaxed) == 1 {
+                    // proxy off + matched app detected: close immediately, ask once
+                    let n = kill_claude_fast();
+                    if n > 0 {
+                        log_line(&format!("[guard] proxy off — closed {n} matched process(es)"));
+                    }
+                    if ASKED_EPISODE.swap(1, Ordering::Relaxed) == 0 {
+                        ask_keep_closed();
+                    }
+                } else if EPISODE_TRIGGERED.load(Ordering::Relaxed) == 0 {
+                    // user chose "allow": fall back to suspend + auto-enable
+                    auto_enable(pids, "claude process detected", hwnd as usize);
+                }
             }
             if proxy_state_off()
                 && EPISODE_TRIGGERED.load(Ordering::Relaxed) == 0
@@ -725,7 +768,7 @@ fn guard_loop(hwnd: HWND) {
                 auto_enable(Vec::new(), "claude.ai / anthropic.com DNS lookup detected", hwnd as usize);
             }
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -758,7 +801,10 @@ fn toggle(hwnd: HWND) {
             set_proxy_state(false);
             // fast native kill first — completes in well under a second
             let n = kill_claude_fast();
-            log_line(&format!("toggle: fast-killed {n} claude process(es)"));
+            log_line(&format!("toggle: fast-killed {n} matched process(es)"));
+            if n > 0 && ASKED_EPISODE.swap(1, Ordering::Relaxed) == 0 {
+                ask_keep_closed();
+            }
             // async sweep (taskkill /T trees + WMI pass) for anything missed
             thread::spawn(|| {
                 kill_claude_blocking();
