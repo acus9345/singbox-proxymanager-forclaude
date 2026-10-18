@@ -54,7 +54,7 @@ Two small binaries (Rust, winapi only, no GUI framework):
 
 ## Requirements
 
-- Windows 10/11 x64
+- mac i guess
 - [Rust](https://rustup.rs) (to build) — `cargo build --release`
 - sing-box installed and runnable via a **scheduled task** (default name
   `sing-box-tun`), e.g.:
