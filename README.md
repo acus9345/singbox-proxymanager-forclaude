@@ -2,7 +2,7 @@
 
 A Windows(well u can use the mac branch on mac but idk if this works) tray controller, watchdog and fail-safe toolkit for a
 [sing-box](https://sing-box.sagernet.org) tunnel with a **static exit IP**.
-BETTER PUT IT BESIDES SINGBOX.
+BETTER PUT IT next to SINGBOX.
 
 If your machine routes all traffic through a SOCKS5/TUN tunnel and you want
 to be certain it never silently falls back to the raw connection, this is
