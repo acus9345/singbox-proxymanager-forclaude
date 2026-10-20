@@ -150,14 +150,54 @@ pub fn http_get(host: &str, path: &str) -> Option<String> {
     text.split("\r\n\r\n").nth(1).map(|s| s.to_string())
 }
 
+// Multi-endpoint on purpose: proxy providers cap concurrent connections, and
+// one refused health-check request must not read as "proxy off".
 pub fn fetch_public_ip() -> Option<String> {
-    let body = http_get("ip-api.com", "/line?fields=query")?;
-    let ip = body.trim();
-    if valid_ipv4(ip) {
-        Some(ip.to_string())
-    } else {
-        None
+    for (host, path) in [
+        ("ip-api.com", "/line?fields=query"),
+        ("ifconfig.me", "/"),
+        ("checkip.amazonaws.com", "/"),
+    ] {
+        if let Some(body) = http_get(host, path) {
+            let ip = body.trim();
+            if valid_ipv4(ip) {
+                return Some(ip.to_string());
+            }
+        }
     }
+    None
+}
+
+// Health checks can be a big share of the proxy's connection budget, so the
+// tray and the banner share one result through this file instead of each
+// running their own check every cycle.
+// Format: "<unix secs> <ip>" or "<unix secs> -" for no connectivity.
+fn exit_ip_cache_file() -> std::path::PathBuf {
+    state_root().join("exit-ip-cache.txt")
+}
+
+/// Exit IP, reusing the other process's result if it is younger than
+/// `max_age_secs`. A cached failure is reused too: hammering a saturated
+/// proxy with more checks only makes the saturation worse.
+pub fn fetch_public_ip_shared(max_age_secs: i64) -> Option<String> {
+    let cache = exit_ip_cache_file();
+    if let Ok(txt) = fs::read_to_string(&cache) {
+        let mut it = txt.split_whitespace();
+        if let (Some(ts), Some(val)) = (it.next().and_then(|t| t.parse::<i64>().ok()), it.next()) {
+            let age = now() - ts;
+            if (0..max_age_secs).contains(&age) {
+                if val == "-" {
+                    return None;
+                }
+                if valid_ipv4(val) {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    let ip = fetch_public_ip();
+    let _ = fs::write(&cache, format!("{} {}", now(), ip.as_deref().unwrap_or("-")));
+    ip
 }
 
 pub fn read_expected_ip() -> Option<String> {

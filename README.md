@@ -104,7 +104,7 @@ Everything is file/env based — no config file to maintain:
 | `SINGBOX_WATCH_TASK` | `sing-box-tun` | scheduled task used to start/stop the tunnel |
 | `SINGBOX_WATCH_KILL_EXCLUDE` | *(empty)* | comma-separated substrings; node.exe command lines containing any of them are never killed (protect your own agent/editor runtimes) |
 
-State files (`expected-exit-ip.txt`, `proxy-state.txt`) are looked up next
+State files (`expected-exit-ip.txt`, `proxy-state.txt`, `exit-ip-cache.txt`) are looked up next
 to the exe first, then `%USERPROFILE%\.singbox-watch\`. Logs and temp files
 land next to the exe (`proxy-tray.log`).
 
@@ -149,6 +149,18 @@ singbox-watch.exe --check-once / --test-banner / --ip <addr> / --install / --uni
 - **Fail-closed over convenience**: when the tunnel can't be verified after
   an auto-enable, matched processes stay suspended instead of being resumed
   into a leaking network.
+- **"No connectivity" is not "proxy off"**: proxy providers often cap
+  concurrent connections (one rejects with a non-standard SOCKS5 reply,
+  code 48, at ~100 open connections). Once the cap is hit, every health
+  check fails while the tunnel is still up — and with `strict_route`
+  nothing can leave un-tunnelled. The kill-switch therefore acts only on
+  positive evidence: a deliberate toggle-off, or a wrong exit IP that is
+  re-verified live. The toggle direction, menu label and icon follow the
+  same rule, so a click on a busy-but-up proxy turns it OFF, not "on" again.
+- **Health checks share one result**: the tray and the banner read a common
+  `exit-ip-cache.txt` (25 s) instead of each probing the IP endpoints, and a
+  cached failure is reused — extra probes only deepen a saturated proxy.
+  Probes fall back across ip-api.com, ifconfig.me and checkip.amazonaws.com.
 - The DNS-cache watcher (auto-enable on fresh `claude.ai`/`anthropic.com`
   lookups) is best-effort: browsers with DoH/"secure DNS" bypass the system
   resolver.

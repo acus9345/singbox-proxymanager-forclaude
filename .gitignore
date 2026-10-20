@@ -7,3 +7,4 @@ expected-exit-ip.txt
 renew-deadline.txt
 proxy-state.txt
 config.json
+exit-ip-cache.txt

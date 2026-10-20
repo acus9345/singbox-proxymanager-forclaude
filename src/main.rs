@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use singbox_watch::{
-    cli_print, expected_file, fetch_public_ip, install_autostart, now, proxy_state_off,
+    cli_print, expected_file, fetch_public_ip, fetch_public_ip_shared, install_autostart, now, proxy_state_off,
     uninstall_autostart, valid_ipv4, wide,
 };
 
@@ -85,7 +85,7 @@ fn monitor_loop(hwnd: HWND) {
     let mut consecutive_fail: u32 = 0;
     loop {
         let mut state = 0u8;
-        match fetch_public_ip() {
+        match fetch_public_ip_shared(25) {
             Some(live) => {
                 consecutive_fail = 0;
                 if live != expected {

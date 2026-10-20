@@ -18,7 +18,8 @@ use std::thread;
 use std::time::Duration;
 
 use singbox_watch::{
-    cli_print, fetch_public_ip, install_autostart, proxy_state_off, read_expected_ip, set_proxy_state,
+    cli_print, fetch_public_ip, fetch_public_ip_shared, install_autostart, proxy_state_off,
+    read_expected_ip, set_proxy_state,
     task_name, uninstall_autostart, wide,
 };
 
@@ -713,14 +714,25 @@ fn enforce_defaults() {
     }
 }
 
+static OFF_VERIFY_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// The proxy counts as ON unless the user switched it off or a wrong exit IP
+/// was actually seen (state 2). A failed health check (state 0, also the
+/// startup value) is "busy/unverified", not "off": proxy providers cap
+/// concurrent connections, and once the cap is hit every check fails while
+/// the tunnel is still up. With strict_route nothing can leave un-tunnelled
+/// in that state, so it must not kill apps or flip the toggle direction.
+fn proxy_on_intended() -> bool {
+    !proxy_state_off() && ACTUAL.load(Ordering::Relaxed) != 2
+}
+
 fn guard_loop(hwnd: HWND) {
     let mut seen_dns: HashSet<Vec<u8>> = HashSet::new();
     let mut tick: u32 = 0;
     log_line("[guard] watching for Claude processes + claude.ai/anthropic.com DNS lookups");
     loop {
         tick = tick.wrapping_add(1);
-        let actual = ACTUAL.load(Ordering::Relaxed);
-        if actual == 1 {
+        if proxy_on_intended() {
             EPISODE_TRIGGERED.store(0, Ordering::Relaxed);
             seen_dns.clear();
             // new off-episode: re-arm the keep-closed policy (safe default)
@@ -746,7 +758,30 @@ fn guard_loop(hwnd: HWND) {
                 );
             }
             let pids = claude_pids_snapshot();
-            if !pids.is_empty() {
+            let mut confirmed_off = proxy_state_off();
+            if !pids.is_empty() && !confirmed_off {
+                // a wrong exit IP was seen by the poll — re-verify it live
+                // (at most once per 5 s) before closing anything
+                let t = singbox_watch::now();
+                if t - OFF_VERIFY_LAST.load(Ordering::Relaxed) >= 5 {
+                    OFF_VERIFY_LAST.store(t, Ordering::Relaxed);
+                    let expected = EXPECTED.lock().unwrap().clone();
+                    match fetch_public_ip() {
+                        Some(ip) if !expected.is_empty() && ip != expected => {
+                            confirmed_off = true;
+                        }
+                        Some(_) => {
+                            log_line("[guard] false OFF — tunnel verified up, not killing");
+                            ACTUAL.store(1, Ordering::Relaxed);
+                        }
+                        None => {
+                            log_line("[guard] re-check got no connectivity — no leak possible, not killing");
+                            ACTUAL.store(0, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            if !pids.is_empty() && confirmed_off {
                 if KEEP_CLOSED.load(Ordering::Relaxed) == 1 {
                     // proxy off + matched app detected: close immediately, ask once
                     let n = kill_claude_fast();
@@ -786,7 +821,7 @@ fn toggle(hwnd: HWND) {
         log_line("toggle: ignored — another toggle already in progress");
         return;
     }
-    let turn_on = ACTUAL.load(Ordering::Relaxed) != 1;
+    let turn_on = !proxy_on_intended();
     let h = hwnd as usize; // raw HWND is not Send
     thread::spawn(move || {
         let _busy = BusyGuard; // clears TOGGLE_BUSY on any exit, incl. panic
@@ -821,7 +856,7 @@ fn toggle(hwnd: HWND) {
 fn poll_loop(hwnd: HWND) {
     loop {
         let expected = EXPECTED.lock().unwrap().clone();
-        let (st, ip) = match fetch_public_ip() {
+        let (st, ip) = match fetch_public_ip_shared(25) {
             Some(ip) => {
                 let s = if !expected.is_empty() && ip == expected { 1u8 } else { 2u8 };
                 (s, ip)
@@ -848,9 +883,12 @@ fn update_icon(hwnd: HWND) {
     let tip = match st {
         1 => format!("sing-box proxy: ON — exit {ip}{}", renew_tag()),
         2 => format!("sing-box proxy: OFF — raw exit {ip}{}", renew_tag()),
-        _ => format!("sing-box proxy: checking…{}", renew_tag()),
+        _ if proxy_on_intended() => {
+            format!("sing-box proxy: ON — exit unverified (proxy busy?){}", renew_tag())
+        }
+        _ => format!("sing-box proxy: OFF — checking…{}", renew_tag()),
     };
-    let hicon = if st == 1 { *ICON_ON.lock().unwrap() } else { *ICON_OFF.lock().unwrap() };
+    let hicon = if proxy_on_intended() { *ICON_ON.lock().unwrap() } else { *ICON_OFF.lock().unwrap() };
     let mut guard = NID.lock().unwrap();
     if let Some(nid) = guard.0.as_mut() {
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -902,8 +940,7 @@ unsafe fn show_menu(hwnd: HWND) {
     if menu.is_null() {
         return;
     }
-    let st = ACTUAL.load(Ordering::Relaxed);
-    let item1 = if st == 1 {
+    let item1 = if proxy_on_intended() {
         "Turn proxy OFF  (kills Claude first)"
     } else {
         "Turn proxy ON"
