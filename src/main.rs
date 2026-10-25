@@ -1,11 +1,12 @@
 // singbox-watch-mac — menu-bar switch, kill-switch and watchdog for a
 // sing-box tunnel with a static exit IP. macOS port of the Windows tool.
 //
-// STATUS: written and reviewed off-platform — the FIRST BUILD must happen on
-// a Mac (`cargo build --release`); minor crate-API adjustments may be needed.
+// STATUS: type-checked for aarch64-apple-darwin and x86_64-apple-darwin
+// (`cargo check --target ...`); not yet linked or run on a real Mac.
 //
 // Behaviour parity with the Windows edition:
-//   - menu-bar icon: green = exit IP matches expected-exit-ip.txt, red = off
+//   - menu-bar icon: green = proxy on (exit IP verified, or unverified because
+//     the proxy is busy), red = off or a wrong exit IP was seen
 //   - left-click toggles the tunnel (launchd service; admin prompt on mac)
 //   - toggle-off kills matched apps FIRST (ps/kill, sub-second)
 //   - keep-closed policy: 100 ms detection while off, kill + ONE dialog per
@@ -24,14 +25,13 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tao::event::Event::{NewEvents, UserEvent};
 use tao::event::StartCause;
-use tao::event_loop::{ControlFlow, EventLoop};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -108,14 +108,45 @@ fn http_get(host: &str, path: &str) -> Option<String> {
     text.split("\r\n\r\n").nth(1).map(|s| s.to_string())
 }
 
+// Multi-endpoint on purpose: proxy providers cap concurrent connections, and
+// one refused health-check request must not read as "proxy off".
 fn fetch_public_ip() -> Option<String> {
-    let body = http_get("ip-api.com", "/line?fields=query")?;
-    let ip = body.trim();
-    if valid_ipv4(ip) {
-        Some(ip.to_string())
-    } else {
-        None
+    for (host, path) in [
+        ("ip-api.com", "/line?fields=query"),
+        ("ifconfig.me", "/"),
+        ("checkip.amazonaws.com", "/"),
+    ] {
+        if let Some(body) = http_get(host, path) {
+            let ip = body.trim();
+            if valid_ipv4(ip) {
+                return Some(ip.to_string());
+            }
+        }
     }
+    None
+}
+
+/// Exit IP, reusing a result younger than `max_age_secs` from
+/// exit-ip-cache.txt ("<unix secs> <ip>" or "<unix secs> -"). A cached
+/// failure is reused too: extra probes only deepen a saturated proxy.
+fn fetch_public_ip_shared(max_age_secs: i64) -> Option<String> {
+    let cache = state_root().join("exit-ip-cache.txt");
+    if let Ok(txt) = std::fs::read_to_string(&cache) {
+        let mut it = txt.split_whitespace();
+        if let (Some(ts), Some(val)) = (it.next().and_then(|t| t.parse::<i64>().ok()), it.next()) {
+            if (0..max_age_secs).contains(&(now() - ts)) {
+                if val == "-" {
+                    return None;
+                }
+                if valid_ipv4(val) {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    let ip = fetch_public_ip();
+    let _ = std::fs::write(&cache, format!("{} {}", now(), ip.as_deref().unwrap_or("-")));
+    ip
 }
 
 fn read_expected_ip() -> Option<String> {
@@ -184,7 +215,11 @@ fn matched_processes() -> Vec<(i32, String)> {
             let argv0 = cmd.split_whitespace().next().unwrap_or("");
             let image = argv0.rsplit('/').next().unwrap_or(argv0);
             let lower = cmd.to_lowercase();
-            let hit = image == "claude"
+            // the CLI binary ("claude"), the desktop app and its helpers
+            // (/Applications/Claude.app/...), or anything matching the
+            // configured string minus exclusions
+            let hit = image.eq_ignore_ascii_case("claude")
+                || lower.contains("/claude.app/contents/")
                 || (lower.contains(&match_str) && !excl.iter().any(|x| lower.contains(x)));
             if hit {
                 out.push((pid, cmd.to_string()));
@@ -194,17 +229,25 @@ fn matched_processes() -> Vec<(i32, String)> {
     out
 }
 
+// one kill(1) for all targets: spawning one process per pid made the
+// "sub-second" kill scale with the number of Claude sessions
 fn kill_matched() -> usize {
     let targets = matched_processes();
-    for (pid, _) in &targets {
-        let _ = Command::new("/bin/kill").arg("-9").arg(pid.to_string()).status();
+    if !targets.is_empty() {
+        let _ = Command::new("/bin/kill")
+            .arg("-9")
+            .args(targets.iter().map(|(p, _)| p.to_string()))
+            .status();
     }
     targets.len()
 }
 
 fn signal_all(pids: &[i32], sig: &str) {
-    for pid in pids {
-        let _ = Command::new("/bin/kill").arg(sig).arg(pid.to_string()).status();
+    if !pids.is_empty() {
+        let _ = Command::new("/bin/kill")
+            .arg(sig)
+            .args(pids.iter().map(|p| p.to_string()))
+            .status();
     }
 }
 
@@ -237,8 +280,10 @@ fn start_tunnel() {
 fn stop_tunnel() {
     log_line("stop: launchd bootout (admin prompt)");
     let label = service_label();
-    let _ = admin_shell(&format!("launchctl bootout system/{label} 2>/dev/null"));
-    let _ = Command::new("/usr/bin/pkill").arg("-9").arg("sing-box").status();
+    // sing-box runs as root, so the pkill fallback must run elevated too
+    let _ = admin_shell(&format!(
+        "launchctl bootout system/{label} 2>/dev/null; pkill -9 -x sing-box 2>/dev/null; true"
+    ));
     thread::sleep(Duration::from_millis(800));
     log_line(if service_running() {
         "stop: FAILED — service still running"
@@ -277,9 +322,10 @@ fn ask_keep_closed() {
         log_line("[ask] proxy off + matched apps closed — asking whether to keep them closed");
         // SAFE DEFAULT FIRST: until answered (or if the dialog can't show),
         // the policy stays "keep closed".
+        // "giving up after" = unanswered → keep closed (safe default)
         let out = Command::new("osascript")
             .arg("-e")
-            .arg("display dialog \"The proxy is OFF, so matched applications were closed to keep them off the raw connection.\\n\\nKeep them closed while the proxy stays off?\\n\\nYes — they stay closed (relaunches are closed again automatically)\\nNo — allow them to run (the proxy will re-enable itself when they start)\" with title \"singbox-watch — proxy is off\" buttons {\"No — allow\", \"Yes — keep closed\"} default button \"Yes — keep closed\" with icon caution")
+            .arg("display dialog \"The proxy is OFF, so matched applications were closed to keep them off the raw connection.\\n\\nKeep them closed while the proxy stays off?\\n\\nYes — they stay closed (relaunches are closed again automatically)\\nNo — allow them to run (the proxy will re-enable itself when they start)\\n\\nChanged your mind later? Menu-bar icon → Keep apps closed while proxy is off.\" with title \"singbox-watch — proxy is off\" buttons {\"No — allow\", \"Yes — keep closed\"} default button \"Yes — keep closed\" with icon caution giving up after 120")
             .output();
         let allow = match out {
             Ok(o) => String::from_utf8_lossy(&o.stdout).to_lowercase().contains("no — allow"),
@@ -306,9 +352,21 @@ static ASKED_EPISODE: AtomicU8 = AtomicU8::new(0);
 static EPISODE_TRIGGERED: AtomicU8 = AtomicU8::new(0);
 static TOGGLE_BUSY: AtomicU8 = AtomicU8::new(0);
 static TUNE_LAST: AtomicI64 = AtomicI64::new(0);
+static OFF_VERIFY_LAST: AtomicI64 = AtomicI64::new(0);
+static LAST_IP: Mutex<String> = Mutex::new(String::new());
 
 enum UiMsg {
     RefreshIcon,
+}
+
+/// The proxy counts as ON unless the user switched it off or a wrong exit IP
+/// was actually seen (state 2). A failed health check (state 0, also the
+/// startup value) is "busy/unverified", not "off": proxy providers cap
+/// concurrent connections, and once the cap is hit every check fails while
+/// the tunnel is still up. Nothing can leak in that state, so it must not
+/// kill apps or flip the toggle direction.
+fn proxy_on_intended() -> bool {
+    !proxy_state_off() && ACTUAL.load(Ordering::Relaxed) != 2
 }
 
 fn renew_tag() -> String {
@@ -382,19 +440,24 @@ fn icon_for(on: bool) -> Option<Icon> {
 
 // ---------- worker threads ----------
 
-fn poll_loop(tx: Sender<UiMsg>) {
+fn poll_loop(tx: EventLoopProxy<UiMsg>) {
     let mut last = 255u8;
     loop {
         let expected = EXPECTED.get().cloned().unwrap_or_default();
-        let st = match fetch_public_ip() {
-            Some(ip) if !expected.is_empty() && ip == expected => 1u8,
+        let ip = fetch_public_ip_shared(25);
+        let st = match &ip {
+            Some(ip) if !expected.is_empty() && *ip == expected => 1u8,
             Some(_) => 2u8,
             None => 0u8,
         };
-        let prev = ACTUAL.swap(st, Ordering::Relaxed);
-        let _ = prev;
+        ACTUAL.store(st, Ordering::Relaxed);
+        *LAST_IP.lock().unwrap() = ip.unwrap_or_default();
+        // keep the state file truthful: a verified-up tunnel is never "off"
+        if st == 1 {
+            set_proxy_state(true);
+        }
+        let _ = tx.send_event(UiMsg::RefreshIcon);
         if st != last {
-            let _ = tx.send(UiMsg::RefreshIcon);
             match st {
                 1 => {
                     notify("singbox-watch", "Tunnel is UP — exit IP verified");
@@ -426,7 +489,7 @@ fn toggle() {
     }
     thread::spawn(|| {
         let _busy = BusyGuard;
-        if ACTUAL.load(Ordering::Relaxed) != 1 {
+        if !proxy_on_intended() {
             log_line("toggle: turning ON");
             set_proxy_state(true);
             enforce_defaults();
@@ -435,7 +498,7 @@ fn toggle() {
             if wait_for_tunnel(&expected, 30) {
                 log_line("toggle: tunnel verified up");
             } else {
-                log_line("toggle: tunnel did NOT verify within 15s");
+                log_line("toggle: tunnel did NOT verify within 30s");
             }
         } else {
             log_line("toggle: turning OFF (kill matched apps first)");
@@ -513,13 +576,34 @@ fn enforce_defaults() {
 fn guard_loop() {
     log_line("[guard] watching for matched processes (100 ms tick)");
     loop {
-        if ACTUAL.load(Ordering::Relaxed) == 1 {
+        if proxy_on_intended() {
             EPISODE_TRIGGERED.store(0, Ordering::Relaxed);
             KEEP_CLOSED.store(1, Ordering::Relaxed);
             ASKED_EPISODE.store(0, Ordering::Relaxed);
         } else {
             let targets = matched_processes();
-            if !targets.is_empty() {
+            let mut confirmed_off = proxy_state_off();
+            if !targets.is_empty() && !confirmed_off {
+                // the poll saw a wrong exit IP — re-verify it live (at most
+                // once per 5 s) before closing anything
+                let t = now();
+                if t - OFF_VERIFY_LAST.load(Ordering::Relaxed) >= 5 {
+                    OFF_VERIFY_LAST.store(t, Ordering::Relaxed);
+                    let expected = EXPECTED.get().cloned().unwrap_or_default();
+                    match fetch_public_ip() {
+                        Some(ip) if !expected.is_empty() && ip != expected => confirmed_off = true,
+                        Some(_) => {
+                            log_line("[guard] false OFF — tunnel verified up, not killing");
+                            ACTUAL.store(1, Ordering::Relaxed);
+                        }
+                        None => {
+                            log_line("[guard] re-check got no connectivity — no leak possible, not killing");
+                            ACTUAL.store(0, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            if !targets.is_empty() && confirmed_off {
                 if KEEP_CLOSED.load(Ordering::Relaxed) == 1 {
                     let n = kill_matched();
                     if n > 0 {
@@ -666,13 +750,12 @@ fn main() {
         return;
     }
 
-    let event_loop: EventLoop<UiMsg> = EventLoop::with_user_event();
+    let event_loop = EventLoopBuilder::<UiMsg>::with_user_event().build();
     let proxy_tx = event_loop.create_proxy();
 
     thread::spawn(move || poll_loop(proxy_tx));
     thread::spawn(guard_loop);
 
-    // tray + menu (created on the main thread inside the run loop)
     TrayIconEvent::set_event_handler(Some(move |event| {
         if let TrayIconEvent::Click {
             button: MouseButton::Left,
@@ -683,68 +766,75 @@ fn main() {
             toggle();
         }
     }));
-    MenuEvent::set_event_handler(Some(move |event| {
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         if event.id() == "toggle" {
             toggle();
         } else if event.id() == "kill" {
             let n = kill_matched();
             log_line(&format!("menu: fast-killed {n} matched process(es)"));
+        } else if event.id() == "keep" {
+            // undo an earlier "No — allow" without touching the proxy
+            KEEP_CLOSED.store(1, Ordering::Relaxed);
+            ASKED_EPISODE.store(1, Ordering::Relaxed);
+            log_line("menu: keep-closed policy re-armed");
+            if !proxy_on_intended() {
+                let n = kill_matched();
+                log_line(&format!("menu: proxy off — closed {n} matched process(es)"));
+            }
         } else if event.id() == "quit" {
             std::process::exit(0);
         }
     }));
 
+    // tray + menu are created on the main thread inside the run loop; the
+    // icon is refreshed only on Init and on the poll thread's nudge — never
+    // with network I/O on the UI thread
     let mut tray: Option<TrayIcon> = None;
+    let toggle_item = MenuItem::with_id("toggle", "Turn proxy OFF  (kills matched apps first)", true, None);
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
-        if let NewEvents(StartCause::Init) = event {
-            let menu = Menu::new();
-            let _ = menu.append(&MenuItem::with_id("toggle", "Toggle proxy", true, None));
-            let _ = menu.append(&MenuItem::with_id("kill", "Kill matched processes now", true, None));
-            let _ = menu.append(&MenuItem::with_id("quit", "Quit singbox-watch", true, None));
-            match TrayIconBuilder::new()
-                .with_menu(Box::new(menu))
-                .with_tooltip(format!("sing-box proxy: starting…{}", renew_tag()))
-                .with_icon(icon_for(false).expect("icon"))
-                .build()
-            {
-                Ok(t) => {
-                    tray = Some(t);
-                    log_line("tray: menu-bar icon added");
+        let refresh = match event {
+            NewEvents(StartCause::Init) => {
+                let menu = Menu::new();
+                let _ = menu.append(&toggle_item);
+                let _ = menu.append(&MenuItem::with_id("kill", "Kill matched processes now", true, None));
+                let _ = menu.append(&MenuItem::with_id("keep", "Keep apps closed while proxy is off", true, None));
+                let _ = menu.append(&MenuItem::with_id("quit", "Quit singbox-watch", true, None));
+                match TrayIconBuilder::new()
+                    .with_menu(Box::new(menu))
+                    // left-click toggles; the menu stays on right-click
+                    .with_menu_on_left_click(false)
+                    .with_tooltip(format!("sing-box proxy: starting…{}", renew_tag()))
+                    .with_icon(icon_for(false).expect("icon"))
+                    .build()
+                {
+                    Ok(t) => {
+                        tray = Some(t);
+                        log_line("tray: menu-bar icon added");
+                    }
+                    Err(e) => log_line(&format!("tray: build FAILED: {e}")),
                 }
-                Err(e) => log_line(&format!("tray: build FAILED: {e}")),
+                true
             }
+            UserEvent(UiMsg::RefreshIcon) => true,
+            _ => false,
+        };
+        if !refresh {
+            return;
         }
-        if let UserEvent(_) = event {
-            // icon refresh requested by the poll thread
-        }
-        if tray.is_some() {
+        if let Some(t) = tray.as_ref() {
             let st = ACTUAL.load(Ordering::Relaxed);
-            if let Some(t) = tray.as_ref() {
-                let _ = t.set_icon(if st == 1 { icon_for(true) } else { icon_for(false) });
-                let ip = fetch_public_ip_cached();
-                let tip = match (&ip, st) {
-                    (Some(ip), 1) => format!("sing-box proxy: ON — exit {ip}{}", renew_tag()),
-                    (Some(ip), _) => format!("sing-box proxy: OFF — raw exit {ip}{}", renew_tag()),
-                    (None, _) => format!("sing-box proxy: checking…{}", renew_tag()),
-                };
-                let _ = t.set_tooltip(Some(tip));
-            }
+            let on = proxy_on_intended();
+            let ip = LAST_IP.lock().unwrap().clone();
+            let _ = t.set_icon(icon_for(on));
+            let tip = match st {
+                1 => format!("sing-box proxy: ON — exit {ip}{}", renew_tag()),
+                2 => format!("sing-box proxy: OFF — raw exit {ip}{}", renew_tag()),
+                _ if on => format!("sing-box proxy: ON — exit unverified (proxy busy?){}", renew_tag()),
+                _ => format!("sing-box proxy: OFF — checking…{}", renew_tag()),
+            };
+            let _ = t.set_tooltip(Some(tip));
+            toggle_item.set_text(if on { "Turn proxy OFF  (kills matched apps first)" } else { "Turn proxy ON" });
         }
     });
-}
-
-fn fetch_public_ip_cached() -> Option<String> {
-    static CACHE: Mutex<Option<(i64, String)>> = Mutex::new(None);
-    let mut g = CACHE.lock().unwrap();
-    if let Some((ts, ip)) = g.clone() {
-        if now() - ts < 10 {
-            return Some(ip);
-        }
-    }
-    let ip = fetch_public_ip();
-    if let Some(ip) = &ip {
-        *g = Some((now(), ip.clone()));
-    }
-    ip
 }

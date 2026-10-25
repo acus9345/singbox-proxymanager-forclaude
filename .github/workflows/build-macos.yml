@@ -1,0 +1,24 @@
+name: build-macos
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: cargo build --release --target aarch64-apple-darwin
+      - run: cargo build --release --target x86_64-apple-darwin
+      - name: universal binary
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/singbox-watch-mac \
+            target/aarch64-apple-darwin/release/singbox-watch-mac \
+            target/x86_64-apple-darwin/release/singbox-watch-mac
+          cp install.sh keep-alive.sh README.md LICENSE dist/
+          ./dist/singbox-watch-mac --kill-list
+      - uses: actions/upload-artifact@v4
+        with:
+          name: singbox-watch-mac
+          path: dist/
