@@ -6,7 +6,8 @@
 //
 // Behaviour parity with the Windows edition:
 //   - menu-bar icon: green = proxy on (exit IP verified, or unverified because
-//     the proxy is busy), red = off or a wrong exit IP was seen
+//     the proxy is busy), red = off or a wrong exit IP was seen; turns red
+//     within 100 ms of sing-box exiting (pid watch)
 //   - left-click toggles the tunnel (launchd service; admin prompt on mac)
 //   - toggle-off kills matched apps FIRST (ps/kill, sub-second)
 //   - keep-closed policy: 100 ms detection while off, kill + ONE dialog per
@@ -126,11 +127,21 @@ fn fetch_public_ip() -> Option<String> {
     None
 }
 
+fn exit_ip_cache_file() -> PathBuf {
+    state_root().join("exit-ip-cache.txt")
+}
+
+/// Drop the shared result so the next check probes live — used when the
+/// tunnel process starts or exits, which makes any cached answer stale.
+fn invalidate_exit_ip_cache() {
+    let _ = std::fs::remove_file(exit_ip_cache_file());
+}
+
 /// Exit IP, reusing a result younger than `max_age_secs` from
 /// exit-ip-cache.txt ("<unix secs> <ip>" or "<unix secs> -"). A cached
 /// failure is reused too: extra probes only deepen a saturated proxy.
 fn fetch_public_ip_shared(max_age_secs: i64) -> Option<String> {
-    let cache = state_root().join("exit-ip-cache.txt");
+    let cache = exit_ip_cache_file();
     if let Ok(txt) = std::fs::read_to_string(&cache) {
         let mut it = txt.split_whitespace();
         if let (Some(ts), Some(val)) = (it.next().and_then(|t| t.parse::<i64>().ok()), it.next()) {
@@ -441,16 +452,25 @@ fn icon_for(on: bool) -> Option<Icon> {
 // ---------- worker threads ----------
 
 fn poll_loop(tx: EventLoopProxy<UiMsg>) {
+    let _ = POLL_THREAD.set(thread::current());
     let mut last = 255u8;
     loop {
         let expected = EXPECTED.get().cloned().unwrap_or_default();
         let ip = fetch_public_ip_shared(25);
-        let st = match &ip {
+        let mut st = match &ip {
             Some(ip) if !expected.is_empty() && *ip == expected => 1u8,
             Some(_) => 2u8,
             None => 0u8,
         };
-        ACTUAL.store(st, Ordering::Relaxed);
+        // no sing-box process = no tunnel, whatever a (up to 25 s old) cached
+        // check says — checked after the fetch, which can outlast a crash
+        if TUNNEL_ALIVE.load(Ordering::Relaxed) == 0 {
+            st = 2;
+        }
+        let prev = ACTUAL.swap(st, Ordering::Relaxed);
+        if prev != st {
+            last = prev; // the process watch may have flipped it already
+        }
         *LAST_IP.lock().unwrap() = ip.unwrap_or_default();
         // keep the state file truthful: a verified-up tunnel is never "off"
         if st == 1 {
@@ -471,7 +491,72 @@ fn poll_loop(tx: EventLoopProxy<UiMsg>) {
             }
             last = st;
         }
-        thread::sleep(Duration::from_secs(10));
+        thread::park_timeout(Duration::from_secs(10)); // wake_poll() cuts this short
+    }
+}
+
+// ---------- tunnel process watch: instant icon flip when sing-box dies ----------
+// The exit-IP poll is slow on purpose (10 s, shared 25 s cache) so health
+// checks don't eat the proxy's connection budget. A dead process is free to
+// detect, so this thread checks the sing-box pid every 100 ms (kill(pid, 0):
+// a syscall, no subprocess) and flips the icon the moment it's gone — no
+// sing-box, no tunnel.
+
+// 0 not running, 1 running, 2 not looked yet (startup)
+static TUNNEL_ALIVE: AtomicU8 = AtomicU8::new(2);
+static POLL_THREAD: OnceLock<thread::Thread> = OnceLock::new();
+
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+
+fn wake_poll() {
+    if let Some(t) = POLL_THREAD.get() {
+        t.unpark();
+    }
+}
+
+fn tunnel_pid() -> Option<i32> {
+    sh("pgrep -x sing-box")?.lines().next()?.trim().parse().ok()
+}
+
+fn pid_alive(pid: i32) -> bool {
+    const EPERM: i32 = 1; // exists, owned by another user (root service)
+    (unsafe { kill(pid, 0) } == 0)
+        || std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+}
+
+fn tunnel_watch_loop(tx: EventLoopProxy<UiMsg>) {
+    loop {
+        let pid = tunnel_pid();
+        let alive = pid.is_some();
+        let prev = TUNNEL_ALIVE.swap(alive as u8, Ordering::AcqRel);
+        if prev != alive as u8 && !(prev == 2 && alive) {
+            // any cached exit IP predates this change
+            invalidate_exit_ip_cache();
+            if alive {
+                log_line("[watch] sing-box started — re-checking exit IP");
+                thread::spawn(|| {
+                    thread::sleep(Duration::from_secs(2)); // let the TUN come up
+                    wake_poll();
+                });
+            } else {
+                log_line("[watch] sing-box not running — tunnel DOWN");
+                if ACTUAL.swap(2, Ordering::Relaxed) == 1 {
+                    notify("singbox-watch", "Tunnel is DOWN — sing-box stopped");
+                }
+                let _ = tx.send_event(UiMsg::RefreshIcon);
+                wake_poll(); // fetch the raw exit IP for the tooltip
+            }
+        }
+        match pid {
+            Some(pid) => {
+                while pid_alive(pid) {
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+            None => thread::sleep(Duration::from_millis(500)),
+        }
     }
 }
 
@@ -594,7 +679,9 @@ fn guard_loop() {
                         Some(ip) if !expected.is_empty() && ip != expected => confirmed_off = true,
                         Some(_) => {
                             log_line("[guard] false OFF — tunnel verified up, not killing");
-                            ACTUAL.store(1, Ordering::Relaxed);
+                            if TUNNEL_ALIVE.load(Ordering::Relaxed) != 0 {
+                                ACTUAL.store(1, Ordering::Relaxed);
+                            }
                         }
                         None => {
                             log_line("[guard] re-check got no connectivity — no leak possible, not killing");
@@ -752,7 +839,9 @@ fn main() {
 
     let event_loop = EventLoopBuilder::<UiMsg>::with_user_event().build();
     let proxy_tx = event_loop.create_proxy();
+    let watch_tx = event_loop.create_proxy();
 
+    thread::spawn(move || tunnel_watch_loop(watch_tx));
     thread::spawn(move || poll_loop(proxy_tx));
     thread::spawn(guard_loop);
 
@@ -829,6 +918,9 @@ fn main() {
             let _ = t.set_icon(icon_for(on));
             let tip = match st {
                 1 => format!("sing-box proxy: ON — exit {ip}{}", renew_tag()),
+                2 if TUNNEL_ALIVE.load(Ordering::Relaxed) == 0 => {
+                    format!("sing-box proxy: OFF — sing-box not running{}", renew_tag())
+                }
                 2 => format!("sing-box proxy: OFF — raw exit {ip}{}", renew_tag()),
                 _ if on => format!("sing-box proxy: ON — exit unverified (proxy busy?){}", renew_tag()),
                 _ => format!("sing-box proxy: OFF — checking…{}", renew_tag()),
