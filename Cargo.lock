@@ -10,6 +10,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "singbox-watch-setup"
+version = "1.0.0"
+dependencies = [
+ "singbox-watch",
+ "winapi",
+]
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

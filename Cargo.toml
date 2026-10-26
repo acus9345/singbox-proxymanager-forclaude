@@ -11,6 +11,12 @@ winapi = { version = "0.3", features = [
     "memoryapi",
 ] }
 
+[workspace]
+# installer/ embeds the release binaries, so it is built after them:
+# build-installer.cmd (plain `cargo build` builds just the apps)
+members = [".", "installer"]
+default-members = ["."]
+
 [profile.release]
 lto = true
 strip = true

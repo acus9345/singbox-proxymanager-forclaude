@@ -1,0 +1,12 @@
+[package]
+name = "singbox-watch-setup"
+version = "1.0.0"
+edition = "2021"
+description = "One-file Windows installer for singbox-watch (embeds the release binaries)"
+
+[dependencies]
+singbox-watch = { path = ".." }
+winapi = { version = "0.3", features = [
+    "winuser", "winbase", "winreg", "winnt", "winerror", "handleapi",
+    "processthreadsapi", "tlhelp32", "shlobj", "shtypes", "combaseapi", "objbase",
+] }

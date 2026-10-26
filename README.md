@@ -21,7 +21,10 @@ Two small binaries (Rust, winapi only, no GUI framework):
 - **Tray switch** — green icon when the exit IP matches the pinned IP, red
   when it doesn't. Left-click toggles the tunnel (starts/stops a scheduled
   task; a UAC prompt appears when elevation is needed). The tooltip always
-  shows the live exit IP and an optional renewal countdown.
+  shows the live exit IP and an optional renewal countdown. The icon turns
+  red the instant `sing-box.exe` exits (the tray waits on the process
+  handle, so there's no polling delay); exit-IP problems while sing-box
+  keeps running still show at the next check (≤ 35 s).
 - **Fail-closed app kill-switch** — turning the proxy off first kills every
   matched application process using a native path (process snapshot +
   `TerminateProcess`, command lines read straight from each process's PEB —
@@ -63,7 +66,27 @@ Two small binaries (Rust, winapi only, no GUI framework):
   schtasks /Create /TN sing-box-tun /TR "wscript.exe C:\path\to\run-hidden.vbs" /SC ONLOGON /RL HIGHEST /F
   ```
 
-## Setup
+## Install (setup.exe)
+
+```
+build-installer.cmd
+```
+
+builds both apps and `target\release\singbox-watch-setup.exe`, one file with
+everything embedded. Run it (no admin needed) and it:
+
+- installs to your existing install's folder, else next to a running
+  `sing-box.exe`, else `%USERPROFILE%\singbox-watch` (or a folder you pick)
+- turns on login autostart for both apps and adds the per-minute keep-alive task
+- offers to pin your current public IP as `expected-exit-ip.txt` if none exists
+- adds an Apps & Features entry (uninstall keeps your config, state and logs)
+- starts both apps
+
+Re-run it to upgrade. Other options: `--silent [--dir <path>]`,
+`--uninstall [--silent]`, `--extract <dir>` (writes the files and changes
+nothing else).
+
+## Manual setup
 
 1. Build and lay out the deployment folder:
 

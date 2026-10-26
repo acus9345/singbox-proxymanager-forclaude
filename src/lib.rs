@@ -200,6 +200,12 @@ pub fn fetch_public_ip_shared(max_age_secs: i64) -> Option<String> {
     ip
 }
 
+/// Drop the shared result so the next check probes live — used when the
+/// tunnel process starts or exits, which makes any cached answer stale.
+pub fn invalidate_exit_ip_cache() {
+    let _ = fs::remove_file(exit_ip_cache_file());
+}
+
 pub fn read_expected_ip() -> Option<String> {
     fs::read_to_string(expected_file())
         .ok()

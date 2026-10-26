@@ -7,19 +7,21 @@
 //   then stops the tunnel task, so nothing slips out during the transition.
 //   Turning ON: verifies defaults, then starts the tunnel scheduled task
 //   (UAC fallback if schtasks is denied).
+// The icon turns red the instant sing-box.exe exits (process-handle wait);
+// the exit-IP poll then fills in the raw IP for the tooltip.
 // Right-click: menu — toggle / kill matched processes / re-add icon / tuning.
 // Tooltip always shows the live exit IP. Auto-starts at login.
 
 use std::collections::HashSet;
 use std::env;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use singbox_watch::{
-    cli_print, fetch_public_ip, fetch_public_ip_shared, install_autostart, proxy_state_off,
-    read_expected_ip, set_proxy_state,
+    cli_print, fetch_public_ip, fetch_public_ip_shared, install_autostart,
+    invalidate_exit_ip_cache, proxy_state_off, read_expected_ip, set_proxy_state,
     task_name, uninstall_autostart, wide,
 };
 
@@ -37,7 +39,7 @@ use winapi::um::shellapi::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
 };
-use winapi::um::synchapi::{CreateMutexW, WaitForSingleObject};
+use winapi::um::synchapi::{CreateMutexW, WaitForMultipleObjects, WaitForSingleObject};
 use winapi::um::tlhelp32::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
@@ -46,7 +48,10 @@ use winapi::um::wingdi::{
     DIB_RGB_COLORS,
 };
 use winapi::um::winbase::{CREATE_NO_WINDOW, STARTF_USESHOWWINDOW};
-use winapi::um::winnt::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, PROCESS_VM_READ};
+use winapi::um::winnt::{
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME, PROCESS_TERMINATE, PROCESS_VM_READ,
+    SYNCHRONIZE,
+};
 use winapi::um::winuser::*;
 
 use winapi::shared::minwindef::{LPARAM, LRESULT};
@@ -772,7 +777,9 @@ fn guard_loop(hwnd: HWND) {
                         }
                         Some(_) => {
                             log_line("[guard] false OFF — tunnel verified up, not killing");
-                            ACTUAL.store(1, Ordering::Relaxed);
+                            if TUNNEL_ALIVE.load(Ordering::Relaxed) != 0 {
+                                ACTUAL.store(1, Ordering::Relaxed);
+                            }
                         }
                         None => {
                             log_line("[guard] re-check got no connectivity — no leak possible, not killing");
@@ -834,6 +841,9 @@ fn toggle(hwnd: HWND) {
         } else {
             log_line("toggle: turning OFF (kill Claude first)");
             set_proxy_state(false);
+            unsafe {
+                PostMessageW(hwnd, WM_UPDATE, 0, 0);
+            }
             // fast native kill first — completes in well under a second
             let n = kill_claude_fast();
             log_line(&format!("toggle: fast-killed {n} matched process(es)"));
@@ -854,15 +864,21 @@ fn toggle(hwnd: HWND) {
 }
 
 fn poll_loop(hwnd: HWND) {
+    let _ = POLL_THREAD.set(thread::current());
     loop {
         let expected = EXPECTED.lock().unwrap().clone();
-        let (st, ip) = match fetch_public_ip_shared(25) {
+        let (mut st, ip) = match fetch_public_ip_shared(25) {
             Some(ip) => {
                 let s = if !expected.is_empty() && ip == expected { 1u8 } else { 2u8 };
                 (s, ip)
             }
             None => (0u8, String::from("<no connectivity>")),
         };
+        // no sing-box process = no tunnel, whatever a (up to 25 s old) cached
+        // check says — checked after the fetch, which can outlast a crash
+        if TUNNEL_ALIVE.load(Ordering::Relaxed) == 0 {
+            st = 2;
+        }
         ACTUAL.store(st, Ordering::Relaxed);
         *LAST_IP.lock().unwrap() = ip;
         // keep the state file truthful: whenever the tunnel is verifiably up,
@@ -873,7 +889,78 @@ fn poll_loop(hwnd: HWND) {
         unsafe {
             PostMessageW(hwnd, WM_UPDATE, 0, 0);
         }
-        thread::sleep(Duration::from_secs(10));
+        thread::park_timeout(Duration::from_secs(10)); // wake_poll() cuts this short
+    }
+}
+
+// ---------- tunnel process watch: instant icon flip when sing-box dies ----------
+// The exit-IP poll is slow on purpose (10 s, shared 25 s cache) so health
+// checks don't eat the proxy's connection budget. A process exit costs nothing
+// to observe, so this thread blocks on the sing-box handle and flips the icon
+// the moment it goes away: no sing-box, no tunnel — no probe needed.
+
+const TUNNEL_EXE: &str = "sing-box.exe";
+// 0 not running, 1 running, 2 not looked yet (startup)
+static TUNNEL_ALIVE: AtomicU8 = AtomicU8::new(2);
+static POLL_THREAD: OnceLock<thread::Thread> = OnceLock::new();
+
+fn wake_poll() {
+    if let Some(t) = POLL_THREAD.get() {
+        t.unpark();
+    }
+}
+
+// returns as soon as one of `pids` exits (kernel wait, no CPU) — or after
+// 250 ms when a handle can't be opened (sing-box running as another user)
+fn wait_any_exit(pids: &[u32]) {
+    let handles: Vec<_> = pids
+        .iter()
+        .map(|&p| unsafe { OpenProcess(SYNCHRONIZE, 0, p) })
+        .filter(|h| !h.is_null())
+        .collect();
+    if !handles.is_empty() && handles.len() == pids.len() && handles.len() <= 64 {
+        unsafe {
+            WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 5000);
+        }
+    } else {
+        thread::sleep(Duration::from_millis(250));
+    }
+    for h in handles {
+        unsafe {
+            CloseHandle(h);
+        }
+    }
+}
+
+fn tunnel_watch_loop(hwnd: usize) {
+    loop {
+        let pids = pids_named(TUNNEL_EXE);
+        let alive = !pids.is_empty();
+        let prev = TUNNEL_ALIVE.swap(alive as u8, Ordering::AcqRel);
+        if prev != alive as u8 && !(prev == 2 && alive) {
+            // any cached exit IP predates this change
+            invalidate_exit_ip_cache();
+            if alive {
+                log_line("[watch] sing-box started — re-checking exit IP");
+                // give the TUN adapter a moment before probing through it
+                thread::spawn(|| {
+                    thread::sleep(Duration::from_secs(2));
+                    wake_poll();
+                });
+            } else {
+                log_line("[watch] sing-box not running — tunnel DOWN");
+                ACTUAL.store(2, Ordering::Relaxed);
+                unsafe {
+                    PostMessageW(hwnd as HWND, WM_UPDATE, 0, 0);
+                }
+                wake_poll(); // fetch the raw exit IP for the tooltip
+            }
+        }
+        if alive {
+            wait_any_exit(&pids);
+        } else {
+            thread::sleep(Duration::from_millis(250));
+        }
     }
 }
 
@@ -882,6 +969,9 @@ fn update_icon(hwnd: HWND) {
     let ip = LAST_IP.lock().unwrap().clone();
     let tip = match st {
         1 => format!("sing-box proxy: ON — exit {ip}{}", renew_tag()),
+        2 if TUNNEL_ALIVE.load(Ordering::Relaxed) == 0 => {
+            format!("sing-box proxy: OFF — sing-box not running{}", renew_tag())
+        }
         2 => format!("sing-box proxy: OFF — raw exit {ip}{}", renew_tag()),
         _ if proxy_on_intended() => {
             format!("sing-box proxy: ON — exit unverified (proxy busy?){}", renew_tag())
@@ -1338,6 +1428,8 @@ fn main() {
 
         let h = hwnd as usize;
         let h_guard = hwnd as usize;
+        let h_watch = hwnd as usize;
+        thread::spawn(move || tunnel_watch_loop(h_watch));
         thread::spawn(move || poll_loop(h as HWND));
         thread::spawn(move || guard_loop(h_guard as HWND));
         update_icon(hwnd);
