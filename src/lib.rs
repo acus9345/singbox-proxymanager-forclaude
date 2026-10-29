@@ -225,6 +225,73 @@ pub fn set_proxy_state(on: bool) {
     let _ = fs::write(state_file(), if on { "on" } else { "off" });
 }
 
+// ---------- feature switches (settings.txt) ----------
+// One "key=on|off" line per switch, shared by both apps and edited from the
+// tray's Settings menu. Missing keys use the defaults
+// below, so an absent file means "everything as before".
+
+/// (key, default, label shown in the tray menu)
+pub const SETTINGS: [(&str, bool, &str); 8] = [
+    ("kill_on_off", true, "Close matched apps when the proxy is turned off"),
+    ("close_while_off", true, "Keep matched apps closed while the proxy is off"),
+    ("ask_keep_closed", true, "Ask before keeping them closed (pop-up)"),
+    ("auto_enable", true, "Auto-enable the proxy when a matched app starts"),
+    ("dns_watch", true, "Auto-enable on claude.ai / anthropic.com DNS lookups"),
+    ("enforce_defaults", true, "Check BBR2 + WebRTC policy on every enable"),
+    ("banner", true, "Always-on-top warning banner"),
+    ("renew_countdown", true, "Renewal countdown in the tooltip"),
+];
+
+pub fn settings_file() -> std::path::PathBuf {
+    state_root().join("settings.txt")
+}
+
+fn read_settings_file() -> Vec<(String, bool)> {
+    fs::read_to_string(settings_file())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            let v = v.trim().to_ascii_lowercase();
+            Some((k.trim().to_string(), v == "on" || v == "1" || v == "true"))
+        })
+        .collect()
+}
+
+// read from disk at most once a second: the guard loop asks every 100 ms
+static SETTINGS_CACHE: std::sync::Mutex<(i64, Vec<(String, bool)>)> =
+    std::sync::Mutex::new((i64::MIN, Vec::new()));
+
+/// Current value of a feature switch (default when unset or unknown).
+pub fn setting(key: &str) -> bool {
+    let default = SETTINGS.iter().find(|s| s.0 == key).map(|s| s.1).unwrap_or(false);
+    let mut c = SETTINGS_CACHE.lock().unwrap();
+    let t = now();
+    if c.0 != t {
+        *c = (t, read_settings_file());
+    }
+    c.1.iter().rev().find(|(k, _)| k == key).map(|(_, v)| *v).unwrap_or(default)
+}
+
+/// Persist one switch; unknown keys are refused.
+pub fn set_setting(key: &str, on: bool) -> bool {
+    if !SETTINGS.iter().any(|s| s.0 == key) {
+        return false;
+    }
+    let mut cur = read_settings_file();
+    cur.retain(|(k, _)| k != key);
+    cur.push((key.to_string(), on));
+    let body: String = SETTINGS
+        .iter()
+        .filter_map(|(k, _, _)| {
+            cur.iter().find(|(ck, _)| ck == k).map(|(_, v)| format!("{k}={}\n", if *v { "on" } else { "off" }))
+        })
+        .collect();
+    let ok = fs::write(settings_file(), body).is_ok();
+    SETTINGS_CACHE.lock().unwrap().0 = i64::MIN; // next read sees it
+    ok
+}
+
 /// Read a REG_SZ value; hklm=false → HKCU. None if key/value missing.
 pub fn read_reg_sz(hklm: bool, subkey: &str, value: &str) -> Option<String> {
     unsafe {

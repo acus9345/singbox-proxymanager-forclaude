@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:colorPrimary">#0A9F3E</item>
+        <item name="android:colorAccent">#0A9F3E</item>
+        <item name="android:statusBarColor">#0F1115</item>
+        <item name="android:navigationBarColor">#0F1115</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowBackground">@color/bg</item>
+    </style>
+    <color name="bg">#0F1115</color>
+    <color name="card">#181B21</color>
+    <color name="text">#E8EAEE</color>
+    <color name="muted">#9097A3</color>
+    <color name="line">#262A32</color>
+</resources>

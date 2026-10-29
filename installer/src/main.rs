@@ -159,7 +159,8 @@ fn stop_apps() {
 fn default_dir() -> (PathBuf, &'static str) {
     if let Some(v) = read_reg_sz(false, RUN_KEY, RUN_VALUES[0]) {
         let exe = PathBuf::from(v.trim().trim_matches('"'));
-        if let Some(d) = exe.parent().filter(|d| d.exists()) {
+        // a stale entry (exe moved or deleted) must not pick its old folder
+        if let Some(d) = exe.parent().filter(|_| exe.exists()) {
             return (d.to_path_buf(), "updates your existing install");
         }
     }

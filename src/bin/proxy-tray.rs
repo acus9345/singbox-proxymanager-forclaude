@@ -9,12 +9,15 @@
 //   (UAC fallback if schtasks is denied).
 // The icon turns red the instant sing-box.exe exits (process-handle wait);
 // the exit-IP poll then fills in the raw IP for the tooltip.
-// Right-click: menu — toggle / kill matched processes / re-add icon / tuning.
+// The click shows an amber "switching" icon at once; green follows as soon
+// as the exit IP verifies (probed every second while switching on).
+// Right-click: menu — toggle / kill matched processes / settings /
+// re-add icon / tuning.
 // Tooltip always shows the live exit IP. Auto-starts at login.
 
 use std::collections::HashSet;
 use std::env;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -22,7 +25,7 @@ use std::time::Duration;
 use singbox_watch::{
     cli_print, fetch_public_ip, fetch_public_ip_shared, install_autostart,
     invalidate_exit_ip_cache, proxy_state_off, read_expected_ip, set_proxy_state,
-    task_name, uninstall_autostart, wide,
+    set_setting, setting, task_name, uninstall_autostart, wide, SETTINGS,
 };
 
 use winapi::shared::minwindef::{UINT, WPARAM};
@@ -85,6 +88,9 @@ fn cmdline_is_kill_target(cl: &str) -> bool {
 }
 
 fn renew_tag() -> String {
+    if !setting("renew_countdown") {
+        return String::new();
+    }
     let Some(deadline) = singbox_watch::renew_deadline_unix() else {
         return String::new();
     };
@@ -106,6 +112,7 @@ static LAST_IP: Mutex<String> = Mutex::new(String::new());
 static EXPECTED: Mutex<String> = Mutex::new(String::new());
 static ICON_ON: Mutex<usize> = Mutex::new(0); // HICON as usize
 static ICON_OFF: Mutex<usize> = Mutex::new(0);
+static ICON_PENDING: Mutex<usize> = Mutex::new(0);
 static TASKBAR_MSG: AtomicU32 = AtomicU32::new(0);
 
 // NOTIFYICONDATAW holds raw HWND/HICON handles — not Send by default.
@@ -262,6 +269,10 @@ static KEEP_CLOSED: AtomicU8 = AtomicU8::new(1);
 static ASKED_EPISODE: AtomicU8 = AtomicU8::new(0);
 
 fn ask_keep_closed() {
+    if !setting("ask_keep_closed") {
+        // no pop-up wanted: the unanswered default applies — keep closed
+        return;
+    }
     thread::spawn(|| {
         log_line("[ask] proxy off + matched apps closed — asking whether to keep them closed");
         let mb = unsafe {
@@ -694,6 +705,9 @@ static TUNE_LAST_UNIX: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI
 const TUNE_COOLDOWN_SECS: i64 = 1800;
 
 fn enforce_defaults() {
+    if !setting("enforce_defaults") {
+        return;
+    }
     if !cc_is_bbr2() || !webrtc_all_blocked() {
         let now_ts = singbox_watch::now();
         if now_ts - TUNE_LAST_UNIX.load(Ordering::Relaxed) < TUNE_COOLDOWN_SECS {
@@ -762,7 +776,11 @@ fn guard_loop(hwnd: HWND) {
                     200,
                 );
             }
-            let pids = claude_pids_snapshot();
+            let keep_closed =
+                setting("close_while_off") && KEEP_CLOSED.load(Ordering::Relaxed) == 1;
+            let can_enable = setting("auto_enable") && EPISODE_TRIGGERED.load(Ordering::Relaxed) == 0;
+            // both switched off: nothing to act on, so don't spend probes
+            let pids = if keep_closed || can_enable { claude_pids_snapshot() } else { Vec::new() };
             let mut confirmed_off = proxy_state_off();
             if !pids.is_empty() && !confirmed_off {
                 // a wrong exit IP was seen by the poll — re-verify it live
@@ -789,7 +807,7 @@ fn guard_loop(hwnd: HWND) {
                 }
             }
             if !pids.is_empty() && confirmed_off {
-                if KEEP_CLOSED.load(Ordering::Relaxed) == 1 {
+                if keep_closed {
                     // proxy off + matched app detected: close immediately, ask once
                     let n = kill_claude_fast();
                     if n > 0 {
@@ -798,12 +816,13 @@ fn guard_loop(hwnd: HWND) {
                     if ASKED_EPISODE.swap(1, Ordering::Relaxed) == 0 {
                         ask_keep_closed();
                     }
-                } else if EPISODE_TRIGGERED.load(Ordering::Relaxed) == 0 {
+                } else if can_enable {
                     // user chose "allow": fall back to suspend + auto-enable
                     auto_enable(pids, "claude process detected", hwnd as usize);
                 }
             }
-            if proxy_state_off()
+            if setting("dns_watch")
+                && proxy_state_off()
                 && EPISODE_TRIGGERED.load(Ordering::Relaxed) == 0
                 && dns_new_claude_lookup(&mut seen_dns)
             {
@@ -821,6 +840,16 @@ impl Drop for BusyGuard {
     }
 }
 
+// 1 while switching ON until the exit IP verifies (amber icon, fast probes)
+static SWITCHING_ON: AtomicU8 = AtomicU8::new(0);
+static SWITCHING_SINCE: AtomicI64 = AtomicI64::new(0);
+const SWITCHING_TIMEOUT_SECS: i64 = 60;
+
+fn switching_on() -> bool {
+    SWITCHING_ON.load(Ordering::Relaxed) == 1
+        && singbox_watch::now() - SWITCHING_SINCE.load(Ordering::Relaxed) < SWITCHING_TIMEOUT_SECS
+}
+
 fn toggle(hwnd: HWND) {
     // debounce: rapid repeated clicks must not stack concurrent kill/stop
     // sequences on top of each other
@@ -830,30 +859,42 @@ fn toggle(hwnd: HWND) {
     }
     let turn_on = !proxy_on_intended();
     let h = hwnd as usize; // raw HWND is not Send
+    // instant feedback: the icon changes before any slow work starts
+    if turn_on {
+        SWITCHING_SINCE.store(singbox_watch::now(), Ordering::Relaxed);
+        SWITCHING_ON.store(1, Ordering::Relaxed);
+    } else {
+        SWITCHING_ON.store(0, Ordering::Relaxed);
+        set_proxy_state(false);
+    }
+    unsafe {
+        PostMessageW(hwnd, WM_UPDATE, 0, 0);
+    }
     thread::spawn(move || {
         let _busy = BusyGuard; // clears TOGGLE_BUSY on any exit, incl. panic
         let hwnd = h as HWND;
         if turn_on {
             log_line("toggle: turning ON");
             set_proxy_state(true);
-            enforce_defaults();
+            // start first; the BBR2/WebRTC check (seconds of netsh/reg calls)
+            // runs alongside instead of in front of the tunnel start
+            thread::spawn(enforce_defaults);
             start_tunnel_blocking();
+            wake_poll();
         } else {
-            log_line("toggle: turning OFF (kill Claude first)");
-            set_proxy_state(false);
-            unsafe {
-                PostMessageW(hwnd, WM_UPDATE, 0, 0);
+            log_line("toggle: turning OFF");
+            if setting("kill_on_off") {
+                // fast native kill first — completes in well under a second
+                let n = kill_claude_fast();
+                log_line(&format!("toggle: fast-killed {n} matched process(es)"));
+                if n > 0 && ASKED_EPISODE.swap(1, Ordering::Relaxed) == 0 {
+                    ask_keep_closed();
+                }
+                // async sweep (taskkill /T trees + WMI pass) for anything missed
+                thread::spawn(|| {
+                    kill_claude_blocking();
+                });
             }
-            // fast native kill first — completes in well under a second
-            let n = kill_claude_fast();
-            log_line(&format!("toggle: fast-killed {n} matched process(es)"));
-            if n > 0 && ASKED_EPISODE.swap(1, Ordering::Relaxed) == 0 {
-                ask_keep_closed();
-            }
-            // async sweep (taskkill /T trees + WMI pass) for anything missed
-            thread::spawn(|| {
-                kill_claude_blocking();
-            });
             stop_tunnel_blocking();
         }
         log_line("toggle: actions complete");
@@ -867,7 +908,10 @@ fn poll_loop(hwnd: HWND) {
     let _ = POLL_THREAD.set(thread::current());
     loop {
         let expected = EXPECTED.lock().unwrap().clone();
-        let (mut st, ip) = match fetch_public_ip_shared(25) {
+        // while switching on, probe live every second so green shows the
+        // moment the tunnel carries traffic; otherwise share the 25 s cache
+        let fast = switching_on();
+        let (mut st, ip) = match fetch_public_ip_shared(if fast { 0 } else { 25 }) {
             Some(ip) => {
                 let s = if !expected.is_empty() && ip == expected { 1u8 } else { 2u8 };
                 (s, ip)
@@ -885,11 +929,13 @@ fn poll_loop(hwnd: HWND) {
         // the watcher should never claim "intentionally off" (stale 'off')
         if st == 1 {
             set_proxy_state(true);
+            SWITCHING_ON.store(0, Ordering::Relaxed);
         }
         unsafe {
             PostMessageW(hwnd, WM_UPDATE, 0, 0);
         }
-        thread::park_timeout(Duration::from_secs(10)); // wake_poll() cuts this short
+        // wake_poll() cuts this short
+        thread::park_timeout(Duration::from_secs(if switching_on() { 1 } else { 10 }));
     }
 }
 
@@ -911,7 +957,7 @@ fn wake_poll() {
 }
 
 // returns as soon as one of `pids` exits (kernel wait, no CPU) — or after
-// 250 ms when a handle can't be opened (sing-box running as another user)
+// 100 ms when a handle can't be opened (sing-box running as another user)
 fn wait_any_exit(pids: &[u32]) {
     let handles: Vec<_> = pids
         .iter()
@@ -923,7 +969,7 @@ fn wait_any_exit(pids: &[u32]) {
             WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, 5000);
         }
     } else {
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(100));
     }
     for h in handles {
         unsafe {
@@ -943,8 +989,9 @@ fn tunnel_watch_loop(hwnd: usize) {
             if alive {
                 log_line("[watch] sing-box started — re-checking exit IP");
                 // give the TUN adapter a moment before probing through it
+                // (while switching on, the poll then retries every second)
                 thread::spawn(|| {
-                    thread::sleep(Duration::from_secs(2));
+                    thread::sleep(Duration::from_millis(if switching_on() { 700 } else { 2000 }));
                     wake_poll();
                 });
             } else {
@@ -959,7 +1006,7 @@ fn tunnel_watch_loop(hwnd: usize) {
         if alive {
             wait_any_exit(&pids);
         } else {
-            thread::sleep(Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -967,7 +1014,9 @@ fn tunnel_watch_loop(hwnd: usize) {
 fn update_icon(hwnd: HWND) {
     let st = ACTUAL.load(Ordering::Relaxed);
     let ip = LAST_IP.lock().unwrap().clone();
+    let pending = st != 1 && switching_on();
     let tip = match st {
+        _ if pending => format!("sing-box proxy: turning ON — verifying exit IP…{}", renew_tag()),
         1 => format!("sing-box proxy: ON — exit {ip}{}", renew_tag()),
         2 if TUNNEL_ALIVE.load(Ordering::Relaxed) == 0 => {
             format!("sing-box proxy: OFF — sing-box not running{}", renew_tag())
@@ -978,7 +1027,13 @@ fn update_icon(hwnd: HWND) {
         }
         _ => format!("sing-box proxy: OFF — checking…{}", renew_tag()),
     };
-    let hicon = if proxy_on_intended() { *ICON_ON.lock().unwrap() } else { *ICON_OFF.lock().unwrap() };
+    let hicon = if pending {
+        *ICON_PENDING.lock().unwrap()
+    } else if proxy_on_intended() {
+        *ICON_ON.lock().unwrap()
+    } else {
+        *ICON_OFF.lock().unwrap()
+    };
     let mut guard = NID.lock().unwrap();
     if let Some(nid) = guard.0.as_mut() {
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -987,6 +1042,7 @@ fn update_icon(hwnd: HWND) {
         nid.hIcon = hicon as _;
         let wtip = wide(&tip);
         let n = wtip.len().min(127); // leave room for the NUL terminator
+        nid.szTip = [0; 128]; // a shorter tip must not keep the old tail
         nid.szTip[..n].copy_from_slice(&wtip[..n]);
 
         let prev = LAST_SHOWN.load(Ordering::Relaxed);
@@ -1025,6 +1081,8 @@ fn update_icon(hwnd: HWND) {
     }
 }
 
+const MENU_SETTING_BASE: usize = 100;
+
 unsafe fn show_menu(hwnd: HWND) {
     let menu = CreatePopupMenu();
     if menu.is_null() {
@@ -1038,6 +1096,14 @@ unsafe fn show_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_STRING, 10, wide(item1).as_ptr());
     AppendMenuW(menu, MF_STRING, 11, wide("Kill Claude processes now").as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+    let sub = CreatePopupMenu();
+    if !sub.is_null() {
+        for (i, (key, _, label)) in SETTINGS.iter().enumerate() {
+            let flags = MF_STRING | if setting(key) { MF_CHECKED } else { MF_UNCHECKED };
+            AppendMenuW(sub, flags, MENU_SETTING_BASE + i, wide(label).as_ptr());
+        }
+        AppendMenuW(menu, MF_POPUP, sub as usize, wide("Settings").as_ptr());
+    }
     AppendMenuW(menu, MF_STRING, 12, wide("Re-add tray icon").as_ptr());
     AppendMenuW(menu, MF_STRING, 13, wide("Apply tuning: BBR2+WebRTC, restart tunnel (admin)").as_ptr());
     let mut pt: POINT = std::mem::zeroed();
@@ -1072,6 +1138,13 @@ unsafe fn show_menu(hwnd: HWND) {
         }
         13 => {
             apply_tuning(hwnd as usize);
+        }
+        c if c >= MENU_SETTING_BASE as i32 && c < (MENU_SETTING_BASE + SETTINGS.len()) as i32 => {
+            let key = SETTINGS[c as usize - MENU_SETTING_BASE].0;
+            let on = !setting(key);
+            set_setting(key, on);
+            log_line(&format!("[settings] {key} = {}", if on { "on" } else { "off" }));
+            update_icon(hwnd);
         }
         _ => {}
     }
@@ -1123,8 +1196,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
 }
 
 // 32x32 ARGB icon via a DIB section (alpha channel — required by the Win11
-// tray): green square with a power symbol (on) / red square with X (off).
-fn make_icon(on: bool) -> usize {
+// tray): green square with a power symbol (on) / red square with X (off) /
+// amber square with three dots (switching on, exit IP not verified yet).
+const ICON_KIND_OFF: u8 = 0;
+const ICON_KIND_ON: u8 = 1;
+const ICON_KIND_PENDING: u8 = 2;
+
+fn make_icon(kind: u8) -> usize {
+    let on = kind == ICON_KIND_ON;
     const S: i32 = 32;
     unsafe {
         let mut bmi: BITMAPINFO = std::mem::zeroed();
@@ -1147,10 +1226,17 @@ fn make_icon(on: bool) -> usize {
             for x in 0..S {
                 let flipped = (S - 1 - y) as i32 * S; // bottom-up storage
                 let idx = (flipped + x) as usize * 4;
-                let (mut r, mut g, mut b) = if on { (10, 185, 70) } else { (200, 45, 45) };
+                let (mut r, mut g, mut b) = match kind {
+                    ICON_KIND_ON => (10, 185, 70),
+                    ICON_KIND_PENDING => (225, 145, 10),
+                    _ => (200, 45, 45),
+                };
                 let dx = x - 16;
                 let dy = y - 16;
-                let white = if on {
+                let white = if kind == ICON_KIND_PENDING {
+                    // three dots in a row
+                    [-9, 0, 9].iter().any(|cx| (dx - cx) * (dx - cx) + dy * dy <= 9)
+                } else if on {
                     let d = ((dx * dx + dy * dy) as f32).sqrt();
                     let ring = d >= 9.0 && d <= 12.0;
                     let gap = dy < -6 && dx.abs() <= 4; // opening at the top of the ring
@@ -1371,8 +1457,9 @@ fn main() {
         log_line(&format!("PANIC: {info}"));
     }));
 
-    *ICON_ON.lock().unwrap() = make_icon(true);
-    *ICON_OFF.lock().unwrap() = make_icon(false);
+    *ICON_ON.lock().unwrap() = make_icon(ICON_KIND_ON);
+    *ICON_OFF.lock().unwrap() = make_icon(ICON_KIND_OFF);
+    *ICON_PENDING.lock().unwrap() = make_icon(ICON_KIND_PENDING);
 
     unsafe {
         TASKBAR_MSG.store(

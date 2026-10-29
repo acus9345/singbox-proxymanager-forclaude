@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Android build: the Unix wrapper must keep LF, the jar stays binary
+android/gradlew text eol=lf
+android/gradlew.bat text eol=crlf
+*.jar binary

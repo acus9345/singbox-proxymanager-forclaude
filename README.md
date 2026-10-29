@@ -9,7 +9,8 @@ to be certain it never silently falls back to the raw connection, this is
 that toolkit. It was built the hard way — every feature corresponds to a
 failure that actually happened.
 
-Two small binaries (Rust, winapi only, no GUI framework):
+Two small binaries (Rust, winapi only, no GUI framework), plus an
+[Android app](#android-app-phone-tunnel-watch) for the phone's own tunnel:
 
 | binary | what it does |
 |---|---|
@@ -20,11 +21,16 @@ Two small binaries (Rust, winapi only, no GUI framework):
 - **to use some of the features go to show hidden icons button on ur task bar and right click our app icon**
 - **Tray switch** — green icon when the exit IP matches the pinned IP, red
   when it doesn't. Left-click toggles the tunnel (starts/stops a scheduled
-  task; a UAC prompt appears when elevation is needed). The tooltip always
-  shows the live exit IP and an optional renewal countdown. The icon turns
-  red the instant `sing-box.exe` exits (the tray waits on the process
-  handle, so there's no polling delay); exit-IP problems while sing-box
-  keeps running still show at the next check (≤ 35 s).
+  task; a UAC prompt appears when elevation is needed). The click changes
+  the icon at once: red for off, amber while switching on, then green as
+  soon as the exit IP verifies (probed every second while switching on; the
+  BBR2/WebRTC check now runs alongside the tunnel start instead of before
+  it). The tooltip always shows the live exit IP and an optional renewal
+  countdown. The icon turns red the instant `sing-box.exe` exits (the tray
+  waits on the process handle, so there's no polling delay); exit-IP
+  problems while sing-box keeps running still show at the next check (≤ 35 s).
+- **Settings** — right-click the tray icon → *Settings* to switch features
+  on and off (stored in `settings.txt`; see below).
 - **Fail-closed app kill-switch** — turning the proxy off first kills every
   matched application process using a native path (process snapshot +
   `TerminateProcess`, command lines read straight from each process's PEB —
@@ -54,6 +60,38 @@ Two small binaries (Rust, winapi only, no GUI framework):
 - **Tuning script** — optional `apply-tuning.cmd` switches Windows to BBR2,
   applies the machine-wide WebRTC `disable_non_proxied_udp` policy for
   Chrome/Edge/Brave, and restarts the tunnel.
+
+## Android app (phone tunnel watch)
+
+`android/` is a native Android app: singbox-watch for the phone. It
+works alongside the sing-box app (SFA) and checks that the phone's own traffic
+goes through sing-box's tunnel. It doesn't control the PC.
+
+- **Instant VPN-drop alert**: when Android reports the VPN gone, the status
+  turns red and you get an alert right away, with no network probe needed.
+- **Exit-IP check**: compares the phone's public IP against your pinned IP
+  (the same plain-HTTP endpoints as the PC). Wrong IP = red alert. No answer
+  = amber, not an alarm (a busy proxy or no signal).
+- **Status notification** that is always visible, and a renewal countdown
+  if you set a date.
+- **Settings** to switch each part on or off: watching, each kind of alert,
+  vibration, quick re-checks while not OK, start after reboot, check interval.
+- **Open sing-box** button, and a shortcut to Android's VPN settings, where
+  *Always-on VPN* + *Block connections without VPN* for sing-box is Android's
+  built-in kill switch.
+
+Build (JDK 17+ and the Android SDK, platform 35):
+
+```
+cd android
+gradlew assembleRelease
+```
+
+The APK lands in `android/app/build/outputs/apk/release/app-release.apk`,
+signed with the debug key so it installs as-is. Copy it to the phone and
+open it (allow "install unknown apps" for your file manager), or
+`adb install app-release.apk`. Then: turn sing-box on, open the app, and tap
+**Pin current IP**.
 
 ## Requirements
 
@@ -127,7 +165,23 @@ Everything is file/env based — no config file to maintain:
 | `SINGBOX_WATCH_TASK` | `sing-box-tun` | scheduled task used to start/stop the tunnel |
 | `SINGBOX_WATCH_KILL_EXCLUDE` | *(empty)* | comma-separated substrings; node.exe command lines containing any of them are never killed (protect your own agent/editor runtimes) |
 
-State files (`expected-exit-ip.txt`, `proxy-state.txt`, `exit-ip-cache.txt`) are looked up next
+Feature switches live in `settings.txt` (one `key=on|off` per line; edit it
+from the tray's *Settings* menu). A missing key keeps its
+default:
+
+| key | default | switches |
+|---|---|---|
+| `kill_on_off` | on | close matched apps when the proxy is turned off |
+| `close_while_off` | on | keep closing matched apps while the proxy is off |
+| `ask_keep_closed` | on | the "keep them closed?" pop-up (off = keep closed silently) |
+| `auto_enable` | on | auto-enable the proxy when a matched app starts |
+| `dns_watch` | on | auto-enable on claude.ai / anthropic.com DNS lookups |
+| `enforce_defaults` | on | BBR2 + WebRTC check on every enable |
+| `banner` | on | the always-on-top warning banner |
+| `renew_countdown` | on | renewal countdown in the tooltip |
+
+State files (`expected-exit-ip.txt`, `proxy-state.txt`, `exit-ip-cache.txt`,
+`settings.txt`) are looked up next
 to the exe first, then `%USERPROFILE%\.singbox-watch\`. Logs and temp files
 land next to the exe (`proxy-tray.log`).
 

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exit-IP checks use plain HTTP on purpose (same endpoints as the PC
+     tray): the answer is just the public IP, and no TLS means the check works
+     the same through the tunnel and around it. Only these hosts are allowed. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">ip-api.com</domain>
+        <domain includeSubdomains="false">ifconfig.me</domain>
+        <domain includeSubdomains="false">checkip.amazonaws.com</domain>
+    </domain-config>
+</network-security-config>

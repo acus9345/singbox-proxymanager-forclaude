@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use singbox_watch::{
     cli_print, expected_file, fetch_public_ip, fetch_public_ip_shared, install_autostart, now, proxy_state_off,
-    uninstall_autostart, valid_ipv4, wide,
+    setting, uninstall_autostart, valid_ipv4, wide,
 };
 
 use winapi::ctypes::c_int;
@@ -132,6 +132,9 @@ fn monitor_loop(hwnd: HWND) {
                 }
             }
         }
+        if !setting("banner") {
+            state = 0; // switched off in the tray's Settings menu
+        }
         STATE.store(state, Ordering::Relaxed);
         unsafe {
             PostMessageW(hwnd, WM_APP_STATE, state as WPARAM, 0);
@@ -220,7 +223,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: UINT, wp: WPARAM, lp: LPARAM)
         }
         WM_TIMER => {
             if IsWindowVisible(hwnd) != 0 {
-                reassert_topmost(hwnd);
+                if setting("banner") {
+                    reassert_topmost(hwnd);
+                } else {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
             }
             0
         }
